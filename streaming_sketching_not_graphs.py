@@ -19,22 +19,65 @@ import hashlib
 # ==========================================
 # Universal Hashing Utilities
 # ==========================================
-def _hash_murmur_like(x, seed, mask=0xFFFFFFFF):
-    """Numerically stable integer hash using 32-bit bitwise mixing."""
-    if isinstance(x, str):
-        val = int(hashlib.md5((x + str(seed)).encode()).hexdigest()[:8], 16)
+def _murmurhash3_x86_32(data: bytes, seed: int = 0, mask=0xFFFFFFFF):
+    """Return a stable 32-bit MurmurHash3 x86_32 hash for byte content."""
+    length = len(data)
+    h1 = seed & mask
+    c1 = 0xCC9E2D51
+    c2 = 0x1B873593
+    i = 0
+
+    while i + 4 <= length:
+        k1 = (
+            data[i]
+            | (data[i + 1] << 8)
+            | (data[i + 2] << 16)
+            | (data[i + 3] << 24)
+        ) & mask
+        k1 = (k1 * c1) & mask
+        k1 = ((k1 << 15) | (k1 >> 17)) & mask
+        k1 = (k1 * c2) & mask
+        h1 ^= k1
+        h1 = ((h1 << 13) | (h1 >> 19)) & mask
+        h1 = (h1 * 5 + 0xE6546B64) & mask
+        i += 4
+
+    tail = length & 3
+    if tail >= 3:
+        k1 = data[i + 2] << 16
     else:
-        val = int(x) ^ (seed * 0x5bd1e995)
-    val = ((val >> 16) ^ val) * 0x45d9f3b
-    val = ((val >> 16) ^ val) * 0x45d9f3b
-    val = (val >> 16) ^ val
-    return val & mask
+        k1 = 0
+    if tail >= 2:
+        k1 ^= data[i + 1] << 8
+    if tail >= 1:
+        k1 ^= data[i]
+        k1 = (k1 * c1) & mask
+        k1 = ((k1 << 15) | (k1 >> 17)) & mask
+        k1 = (k1 * c2) & mask
+        h1 ^= k1
+
+    h1 ^= length
+    h1 ^= h1 >> 16
+    h1 = (h1 * 0x85EBCA6B) & mask
+    h1 ^= h1 >> 13
+    h1 = (h1 * 0xC2B2AE3D) & mask
+    h1 ^= h1 >> 16
+    return h1 & mask
 
 
-def _count_trailing_zeros(v):
+def _hash_murmur_like(x, seed=0, mask=0xFFFFFFFF):
+    """Stable 32-bit hash for strings, ints, and bytes."""
+    if isinstance(x, bytes):
+        payload = x
+    else:
+        payload = str(x).encode("utf-8")
+    return _murmurhash3_x86_32(payload, seed=seed, mask=mask)
+
+
+def _count_leading_zeros(v):
     if v == 0:
         return 32
-    return (v & -v).bit_length() - 1
+    return 32 - v.bit_length()
 
 
 # ==========================================
@@ -65,17 +108,17 @@ class BloomFilter:
 class FlajoletMartin:
     def __init__(self, num_hashes=16):
         self.num_hashes = num_hashes
-        self.max_trailing_zeros = np.zeros(num_hashes, dtype=int)
+        self.max_leading_zeros = np.zeros(num_hashes, dtype=int)
 
     def process(self, item):
         for i in range(self.num_hashes):
             h = _hash_murmur_like(item, seed=i)
-            tz = _count_trailing_zeros(h)
-            self.max_trailing_zeros[i] = max(self.max_trailing_zeros[i], tz)
+            rho = _count_leading_zeros(h)
+            self.max_leading_zeros[i] = max(self.max_leading_zeros[i], rho)
 
     def estimate(self):
         phi = 0.77351  # Correction constant
-        estimates = (2.0 ** self.max_trailing_zeros) / phi
+        estimates = (2.0 ** self.max_leading_zeros) / phi
         return np.median(estimates)
 
 
@@ -87,7 +130,7 @@ class HyperLogLog:
         self.p = p
         self.m = 1 << p
         self.registers = np.zeros(self.m, dtype=int)
-        
+
         # Alpha correction factor
         if self.m == 16:
             self.alpha = 0.673
@@ -99,17 +142,22 @@ class HyperLogLog:
             self.alpha = 0.7213 / (1.0 + 1.079 / self.m)
 
     def process(self, item):
-        h = _hash_murmur_like(item, seed=42)
-        idx = h >> (32 - self.p)  # First p bits define register index
-        w = (h << self.p) & 0xFFFFFFFF  # Remaining bits
-        leading_zeros = 1 + _count_trailing_zeros(w)
-        self.registers[idx] = max(self.registers[idx], leading_zeros)
+        h = _hash_murmur_like(item, seed=42) & 0xFFFFFFFF
+        idx = h >> (32 - self.p)
+        remainder_bits = 32 - self.p
+        remainder = h & ((1 << remainder_bits) - 1)
+
+        if remainder == 0:
+            rho = remainder_bits + 1
+        else:
+            rho = 1 + (remainder_bits - remainder.bit_length())
+
+        self.registers[idx] = max(self.registers[idx], rho)
 
     def estimate(self):
-        # Harmonic mean
         indicator = np.sum(2.0 ** (-self.registers))
         raw_estimate = self.alpha * (self.m ** 2) / indicator
-        
+
         # Small range correction
         if raw_estimate <= 2.5 * self.m:
             zeros = np.count_nonzero(self.registers == 0)
@@ -318,7 +366,7 @@ def run_streaming_benchmarks():
     ax3.bar(x_indices + width, mg_errs, width=width, label='Misra-Gries', color='#2ca02c')
     ax3.set_title("Absolute Error on Top 20 Heavy Hitters", fontsize=11, fontweight='bold')
     ax3.set_xlabel("Item Rank")
-    ax3.set_ylabel("Absolute Frequency Error $|f - \hat{f}|$")
+    ax3.set_ylabel(r"Absolute Frequency Error $|f - \hat{f}|$")
     ax3.grid(True, linestyle=":", alpha=0.6)
     ax3.legend()
 
